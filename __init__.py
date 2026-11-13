@@ -1,10 +1,10 @@
 bl_info = {
     "name": "MQScar",
     "author": "MQS",
-    "version": (0, 21, 0),
+    "version": (0, 22, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar (N) > MQScar",
-    "description": "Rigid body car rig generator with car-type presets",
+    "description": "Rigid body car rig generator with car-type presets, plus Curve Mode (marker-driven driving)",
     "category": "Rigging",
 }
 
@@ -18,6 +18,8 @@ from bpy.props import (
 )
 from bpy.types import Panel, Operator, PropertyGroup
 from bpy.app.handlers import persistent
+
+from . import follow     # Curve Mode (marker-driven driving), drawn inside this add-on's panel
 
 # --------------------------------------------------------------------------
 # Constants
@@ -632,6 +634,16 @@ def mesh_poll(self, obj):
     return obj.type == 'MESH'
 
 
+def _rig_section_update(self, context):
+    if self.show_rig_section and self.show_curve_section:
+        self.show_curve_section = False
+
+
+def _curve_section_update(self, context):
+    if self.show_curve_section and self.show_rig_section:
+        self.show_rig_section = False
+
+
 class MQSCAR_Props(PropertyGroup):
     # Pickers
     body: PointerProperty(name="Body", type=bpy.types.Object, poll=mesh_poll, update=body_update)
@@ -709,6 +721,10 @@ class MQSCAR_Props(PropertyGroup):
 
     # Advanced (baked when the rig is generated)
     show_advanced: BoolProperty(name="Advanced", default=True)
+
+    # Which top-level section of the panel is open (only one at a time)
+    show_rig_section: BoolProperty(name="Rigging", default=True, update=_rig_section_update)
+    show_curve_section: BoolProperty(name="Curve Mode", default=False, update=_curve_section_update)
     mass: FloatProperty(
         name="Weight",
         description="Car body weight in kg. Estimated when you pick the body, but you can "
@@ -1642,6 +1658,30 @@ class MQSCAR_PT_main(Panel):
     def draw(self, context):
         layout = self.layout
         p = context.scene.mqscar
+        marker_mode = bool(getattr(getattr(context.scene, "mqfollow2", None), "marker_mode", False))
+
+        # Section 1: Rigging (open by default, collapses while Curve Mode is open)
+        box = layout.box()
+        row = box.row()
+        row.prop(p, "show_rig_section", text="Rigging",
+                 icon='TRIA_DOWN' if p.show_rig_section else 'TRIA_RIGHT', emboss=False)
+        if p.show_rig_section:
+            self.draw_rig(context, box)
+
+        # Section 2: Curve Mode (collapsed by default, collapses Rigging when opened)
+        box = layout.box()
+        row = box.row()
+        row.prop(p, "show_curve_section", text="Curve Mode",
+                 icon='TRIA_DOWN' if p.show_curve_section else 'TRIA_RIGHT', emboss=False)
+        if marker_mode:
+            sub = row.row()
+            sub.alert = True
+            sub.label(text="ACTIVE", icon='RADIOBUT_ON')
+        if p.show_curve_section:
+            follow.draw_follow(box, context)
+
+    def draw_rig(self, context, layout):
+        p = context.scene.mqscar
 
         # Components
         box = layout.box()
@@ -1745,9 +1785,14 @@ def register():
     bpy.types.Scene.mqscar = PointerProperty(type=MQSCAR_Props)
     if _on_load not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_on_load)
+    follow.register()
 
 
 def unregister():
+    try:
+        follow.unregister()
+    except Exception:
+        traceback.print_exc()
     _HOLD.clear()
     if bpy.app.timers.is_registered(_hold_tick):
         bpy.app.timers.unregister(_hold_tick)
@@ -1761,8 +1806,3 @@ def unregister():
         except Exception:
             pass
 
-
-if __name__ == "__main__":
-    # Safe to re-run from the Text Editor
-    unregister()
-    register()
