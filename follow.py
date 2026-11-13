@@ -1039,6 +1039,8 @@ class MQFOLLOW2_Props(PropertyGroup):
     surface_snap: BoolProperty(name="Snap to Ground Collection", default=True,
         description="Place markers only on mesh objects in MQScar's selected Ground Collection")
     show_markers: BoolProperty(name="Show Route Markers", default=True)
+    show_lines: BoolProperty(name="Show Route Lines", default=True,
+        description="Show or hide the route line, the reverse lines and the speed graph")
     marker_mode: BoolProperty(name="Marker Mode", default=False)
     placing_markers: BoolProperty(name="Placing Markers", default=False)
     marker_number: IntProperty(name="Marker Number", get=_get_active_marker_number,
@@ -1596,6 +1598,21 @@ def set_markers_visible(scene, visible):
             pin.hide_viewport = not visible
 
 
+LINE_PREFIXES = (PATH_NAME, SPEED_GRAPH_NAME)   # route line (and reverse legs) + speed graph
+
+
+def get_line_objects():
+    return [o for o in bpy.data.objects if o.name.startswith(LINE_PREFIXES)]
+
+
+def set_lines_visible(scene, visible):
+    for ob in get_line_objects():
+        try:
+            ob.hide_set(not visible)
+        except Exception:
+            ob.hide_viewport = not visible
+
+
 def surface_hit_from_event(context, event, flat_z=None):
     region, rv3d, coord = viewport_region_and_coord(context, event)
     if region is None or rv3d is None:
@@ -1762,6 +1779,19 @@ class MQFOLLOW2_OT_toggle_markers(Operator):
         p = context.scene.mqfollow2
         p.show_markers = not p.show_markers
         set_markers_visible(context.scene, p.show_markers)
+        return {'FINISHED'}
+
+
+class MQFOLLOW2_OT_toggle_lines(Operator):
+    bl_idname = "mqfollow2.toggle_lines"
+    bl_label = "Toggle Route Lines"
+    bl_description = "Show or hide the route line, the reverse lines and the speed graph (markers are not affected)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        p = context.scene.mqfollow2
+        p.show_lines = not p.show_lines
+        set_lines_visible(context.scene, p.show_lines)
         return {'FINISHED'}
 
 
@@ -2019,9 +2049,10 @@ def draw_follow(lay, context):
     else:
         lay.operator("mqfollow2.start_placing", text="Start / Resume Placement (Alt + Click)", icon='EMPTY_AXIS')
 
+    lay.operator("mqfollow2.select_markers", text="Select All Markers", icon='RESTRICT_SELECT_OFF')
     row = lay.row(align=True)
-    row.operator("mqfollow2.select_markers", text="Select All", icon='RESTRICT_SELECT_OFF')
-    row.operator("mqfollow2.toggle_markers", text="Show/Hide", icon='HIDE_OFF' if f.show_markers else 'HIDE_ON')
+    row.operator("mqfollow2.toggle_markers", text="Markers", icon='HIDE_OFF' if f.show_markers else 'HIDE_ON')
+    row.operator("mqfollow2.toggle_lines", text="Lines", icon='HIDE_OFF' if f.show_lines else 'HIDE_ON')
 
     active = context.view_layer.objects.active
     active_pin = active if active is not None and PIN_KEY in active else None
@@ -2088,6 +2119,13 @@ def _mqfollow_marker_visibility_timer():
             for pin in all_pins:
                 if pin.hide_get() == desired:
                     pin.hide_set(not desired)
+            want_lines = bool(scene.mqfollow2.show_lines)
+            for ob in get_line_objects():
+                try:
+                    if ob.hide_get() == want_lines:
+                        ob.hide_set(not want_lines)
+                except Exception:
+                    pass
     except Exception:
         pass
     return 0.25
@@ -2098,7 +2136,7 @@ def _mqfollow_marker_visibility_timer():
 # --------------------------------------------------------------------------
 classes = (MQFOLLOW2_Props, MQFOLLOW2_OT_place_pins, MQFOLLOW2_OT_stop_placing,
            MQFOLLOW2_OT_toggle_marker_mode, MQFOLLOW2_OT_start_placing,
-           MQFOLLOW2_OT_remove_pin, MQFOLLOW2_OT_toggle_markers,
+           MQFOLLOW2_OT_remove_pin, MQFOLLOW2_OT_toggle_markers, MQFOLLOW2_OT_toggle_lines,
            MQFOLLOW2_OT_select_markers, MQFOLLOW2_OT_drive, MQFOLLOW2_OT_clear)
 OLD_CLASSES = ("MQFOLLOW2_OT_pin", "MQFOLLOW2_OT_bake", "MQFOLLOW2_OT_speed_segments", "MQFOLLOW2_PT_main")
 addon_keymaps = []

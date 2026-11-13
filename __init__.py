@@ -1,10 +1,10 @@
 bl_info = {
     "name": "MQScar",
     "author": "MQS",
-    "version": (0, 22, 0),
+    "version": (0, 23, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar (N) > MQScar",
-    "description": "Rigid body car rig generator with car-type presets, plus Curve Mode (marker-driven driving)",
+    "description": "Rigid body car rig generator with car-type presets, plus Curve Mode (marker-driven driving) and Slide (drift-style secondary motion)",
     "category": "Rigging",
 }
 
@@ -20,6 +20,7 @@ from bpy.types import Panel, Operator, PropertyGroup
 from bpy.app.handlers import persistent
 
 from . import follow     # Curve Mode (marker-driven driving), drawn inside this add-on's panel
+from . import slide      # Slide (secondary motion on the baked drive), drawn inside this add-on's panel
 
 # --------------------------------------------------------------------------
 # Constants
@@ -634,14 +635,26 @@ def mesh_poll(self, obj):
     return obj.type == 'MESH'
 
 
+def _open_only(props, keep):
+    """Only one top-level section is open at a time."""
+    for name in ("show_rig_section", "show_curve_section", "show_slide_section"):
+        if name != keep and getattr(props, name):
+            setattr(props, name, False)
+
+
 def _rig_section_update(self, context):
-    if self.show_rig_section and self.show_curve_section:
-        self.show_curve_section = False
+    if self.show_rig_section:
+        _open_only(self, "show_rig_section")
 
 
 def _curve_section_update(self, context):
-    if self.show_curve_section and self.show_rig_section:
-        self.show_rig_section = False
+    if self.show_curve_section:
+        _open_only(self, "show_curve_section")
+
+
+def _slide_section_update(self, context):
+    if self.show_slide_section:
+        _open_only(self, "show_slide_section")
 
 
 class MQSCAR_Props(PropertyGroup):
@@ -725,6 +738,7 @@ class MQSCAR_Props(PropertyGroup):
     # Which top-level section of the panel is open (only one at a time)
     show_rig_section: BoolProperty(name="Rigging", default=True, update=_rig_section_update)
     show_curve_section: BoolProperty(name="Curve Mode", default=False, update=_curve_section_update)
+    show_slide_section: BoolProperty(name="Slide", default=False, update=_slide_section_update)
     mass: FloatProperty(
         name="Weight",
         description="Car body weight in kg. Estimated when you pick the body, but you can "
@@ -1680,6 +1694,14 @@ class MQSCAR_PT_main(Panel):
         if p.show_curve_section:
             follow.draw_follow(box, context)
 
+        # Section 3: Slide (collapsed by default, collapses the other sections when opened)
+        box = layout.box()
+        row = box.row()
+        row.prop(p, "show_slide_section", text="Slide",
+                 icon='TRIA_DOWN' if p.show_slide_section else 'TRIA_RIGHT', emboss=False)
+        if p.show_slide_section:
+            slide.draw_slide(box, context)
+
     def draw_rig(self, context, layout):
         p = context.scene.mqscar
 
@@ -1786,9 +1808,14 @@ def register():
     if _on_load not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_on_load)
     follow.register()
+    slide.register()
 
 
 def unregister():
+    try:
+        slide.unregister()
+    except Exception:
+        traceback.print_exc()
     try:
         follow.unregister()
     except Exception:
