@@ -96,6 +96,17 @@ OLD_OBJECTS = ("MQFollow_FrontTrack", "MQFollow_RearTrack", "MQFollow_FrontMark"
 PARTS_KEY = "mqfollow_parts"       # names of the objects this script keyframed
 OWN_ACTION = "mqf_own_action"
 
+# Jump feature (integrated from the tested standalone override)
+JUMP_FLAG = "mqfollow_jump_mark"
+JUMP_AUTO = "mqfollow_jump_auto"
+JUMP_HEIGHT = "mqfollow_jump_height"
+JUMP_TILT = "mqfollow_jump_tilt"
+JUMP_GRAVITY = 9.81
+JUMP_MIN_AIR_FRAMES = 3
+JUMP_MAX_AUTO_HEIGHT = 6.0
+JUMP_COLOR = (1.0, 0.1, 0.9, 1.0)
+JUMP_FIND_TOL = 1.5
+
 
 # --------------------------------------------------------------------------
 # Small 4x4 matrix helpers in plain Python (rows of 4 numbers), easy to test
@@ -1660,13 +1671,26 @@ class MQFOLLOW2_OT_place_pins(Operator):
         return {'RUNNING_MODAL'}
 
     def modal(self, context, event):
+        # A modal event can arrive after the originating editor has been closed.
+        if context.area is None:
+            try:
+                context.scene.mqfollow2.placing_markers = False
+            except Exception:
+                pass
+            try:
+                if context.workspace is not None:
+                    context.workspace.status_text_set(None)
+            except Exception:
+                pass
+            return {'FINISHED'}
         if not context.scene.mqfollow2.marker_mode or not context.scene.mqfollow2.placing_markers:
             context.workspace.status_text_set(None)
             return {'FINISHED'}
         if event.type in {'ESC', 'RIGHTMOUSE'} and event.value == 'PRESS':
             context.workspace.status_text_set(None)
             context.scene.mqfollow2.placing_markers = False
-            context.area.tag_redraw()
+            if context.area is not None:
+                context.area.tag_redraw()
             context.scene.mqfollow2.info = (f"Marker Mode is active. {len(get_pins())} marker(s). "
                                              "Select a marker, edit its settings, or Bake.")
             return {'FINISHED'}
@@ -1678,7 +1702,8 @@ class MQFOLLOW2_OT_place_pins(Operator):
             if hit is not None:
                 create_pin(context.scene, hit.x, hit.y, hit.z)
                 context.scene.mqfollow2.info = f"{len(get_pins())} marker(s). Continue with Alt+Click or finish placement."
-                context.area.tag_redraw()
+                if context.area is not None:
+                    context.area.tag_redraw()
             return {'RUNNING_MODAL'}
         return {'PASS_THROUGH'}
 
@@ -1811,6 +1836,232 @@ class MQFOLLOW2_OT_select_markers(Operator):
         context.scene.mqfollow2.show_markers = True
         context.scene.mqfollow2.info = "Move selected markers with G in Object Mode. Bake to rebuild the route."
         return {'FINISHED'}
+
+
+# --------------------------------------------------------------------------
+# Jump feature: add a height arc to the baked animation without changing the route
+# --------------------------------------------------------------------------
+def _jump_arc_height(t, peak):
+    return peak * 4.0 * t * (1.0 - t)
+
+def _jump_auto_peak(air_frames, fps):
+    duration = max(float(air_frames), 0.0) / max(float(fps), 1e-6)
+    return min(JUMP_MAX_AUTO_HEIGHT, 0.125 * JUMP_GRAVITY * duration * duration)
+
+def _jump_tilt_angle(t, tilt):
+    return tilt * sin(2.0 * pi * t)
+
+def _jump_pairs(pins):
+    return [i for i, pin in enumerate(pins[:-1]) if bool(getattr(pin, JUMP_FLAG, False))]
+
+def _jump_selected_numbers(context):
+    return [int(obj[PIN_KEY]) for obj in context.selected_objects if PIN_KEY in obj]
+
+def _jump_plan_selected(numbers, count):
+    nums = sorted(set(int(n) for n in numbers if 1 <= int(n) <= count))
+    if len(nums) == 1:
+        return [nums[0]] if nums[0] < count else []
+    return [n for n in nums if n + 1 in nums]
+
+def _jump_find_frame(positions, xy, start, tol=JUMP_FIND_TOL):
+    if not positions:
+        return 0, float("inf")
+    start = max(0, min(int(start), len(positions) - 1))
+    best, best_i = float("inf"), start
+    for i in range(start, len(positions)):
+        d = hypot(positions[i][0] - xy[0], positions[i][1] - xy[1])
+        if d < best - 1e-9:
+            best, best_i = d, i
+        elif best < tol and d > best + tol:
+            break
+    return best_i, best
+
+def _jump_eval_location(obj, frame):
+    ad = obj.animation_data
+    loc = list(obj.location)
+    if ad is not None and ad.action is not None:
+        for idx in range(3):
+            fc = ad.action.fcurves.find("location", index=idx)
+            if fc is not None:
+                loc[idx] = fc.evaluate(frame)
+    return loc
+
+def _jump_axle_positions(wheels, frames, role_names, role_to_obj):
+    result = []
+    for frame in frames:
+        xy = [0.0, 0.0]
+        for role in role_names:
+            loc = _jump_eval_location(role_to_obj[role], frame)
+            xy[0] += loc[0]
+            xy[1] += loc[1]
+        result.append((xy[0] / len(role_names), xy[1] / len(role_names)))
+    return result
+
+def apply_jumps(context):
+    """Apply configured jumps to the just-baked keys. Returns (count, message)."""
+    scene = context.scene
+    pins = get_pins()
+    jump_starts = _jump_pairs(pins)
+    if not jump_starts:
+        return 0, ""
+
+    span = scene.get("mqfollow_span")
+    baked_names = list(scene.get(PARTS_KEY, []))
+    if not span or not baked_names:
+        return 0, "Jump: no baked vehicle animation was found."
+    frame_start, frame_end = int(span[0]), int(span[1])
+    frames = list(range(frame_start, frame_end + 1))
+    fps = scene.render.fps / max(scene.render.fps_base, 1e-6)
+
+    parts = {name: bpy.data.objects.get(name) for name in baked_names}
+    parts = {name: obj for name, obj in parts.items() if obj is not None}
+    props = scene.mqscar
+    role_to_obj = {role: getattr(props, role, None) for role in WHEEL_ATTRS}
+    missing_roles = [role for role, obj in role_to_obj.items() if obj is None]
+    if missing_roles:
+        return 0, "Jump: missing wheel assignments: " + ", ".join(missing_roles)
+    role_to_name = {role: obj.name for role, obj in role_to_obj.items()}
+    missing_names = [name for name in role_to_name.values() if name not in parts]
+    if missing_names:
+        return 0, "Jump: wheel objects are not part of the baked animation: " + ", ".join(missing_names)
+    if any(obj.parent is not None for obj in parts.values()):
+        return 0, "Jump: one or more baked car parts have parents; cannot safely apply world-space jump keys."
+
+    reverse_marks = [bool(getattr(pin, "mqfollow_reverse_mark", False)) for pin in pins]
+    gears = gear_states(reverse_marks)
+    front_positions = _jump_axle_positions(parts, frames, FRONT_ATTRS, role_to_obj)
+    rear_positions = _jump_axle_positions(parts, frames, ("wheel_rl", "wheel_rr"), role_to_obj)
+
+    marker_frames = {}
+    cursor = 0
+    for index, pin in enumerate(pins):
+        reverse_leg = bool(gears[index - 1]) if index > 0 else False
+        positions = rear_positions if reverse_leg else front_positions
+        xy = (pin.matrix_world.translation.x, pin.matrix_world.translation.y)
+        found, distance = _jump_find_frame(positions, xy, cursor)
+        marker_frames[index] = (found, distance)
+        cursor = found
+
+    jumps = []
+    for index in jump_starts:
+        takeoff = marker_frames[index][0]
+        lead_positions = rear_positions if (index > 0 and gears[index - 1]) else front_positions
+        while takeoff + 1 < len(frames) and hypot(
+                lead_positions[takeoff + 1][0] - lead_positions[takeoff][0],
+                lead_positions[takeoff + 1][1] - lead_positions[takeoff][1]) < 1e-4:
+            takeoff += 1
+        landing = marker_frames[index + 1][0]
+        if landing - takeoff < JUMP_MIN_AIR_FRAMES:
+            continue
+        pin = pins[index]
+        if bool(getattr(pin, JUMP_AUTO, True)):
+            peak = _jump_auto_peak(landing - takeoff, fps)
+        else:
+            peak = max(0.0, float(getattr(pin, JUMP_HEIGHT, 1.0)))
+        tilt = radians(float(getattr(pin, JUMP_TILT, 6.0)))
+        if gears[index]:
+            tilt = -tilt
+        jumps.append((index, frames[takeoff], frames[landing], peak, tilt))
+
+    if not jumps:
+        return 0, "Jump: selected markers are too close together or were not reached."
+
+    restore_frame = scene.frame_current
+    affected = sorted({frame for _i, a, b, _h, _t in jumps for frame in range(a, b + 1)})
+    snapshots = {}
+    for frame in affected:
+        scene.frame_set(frame)
+        snapshots[frame] = {name: obj.matrix_world.copy() for name, obj in parts.items()}
+
+    done = 0
+    for _index, takeoff, landing, peak, tilt in jumps:
+        duration = float(landing - takeoff)
+        for frame in range(takeoff, landing + 1):
+            t = (frame - takeoff) / duration
+            dz = _jump_arc_height(t, peak)
+            angle = _jump_tilt_angle(t, tilt)
+            mats = snapshots[frame]
+            # The baked part matrices are keyed by Blender object names, not wheel role IDs.
+            fl = mats[role_to_name["wheel_fl"]].translation
+            fr = mats[role_to_name["wheel_fr"]].translation
+            rl = mats[role_to_name["wheel_rl"]].translation
+            rr = mats[role_to_name["wheel_rr"]].translation
+            center = (fl + fr + rl + rr) * 0.25
+            left_axis = ((fl + rl) * 0.5) - ((fr + rr) * 0.5)
+            left_axis.z = 0.0
+            if left_axis.length < 1e-6:
+                left_axis = Vector((0.0, 1.0, 0.0))
+            left_axis.normalize()
+            rotation = (Matrix.Translation(center) @ Matrix.Rotation(-angle, 4, left_axis)
+                        @ Matrix.Translation(-center))
+            translation = Matrix.Translation((0.0, 0.0, dz))
+            for name, obj in parts.items():
+                obj.matrix_world = translation @ rotation @ mats[name]
+                key_object(obj, frame)
+        done += 1
+
+    try:
+        scene.frame_set(restore_frame)
+    except Exception:
+        pass
+    return done, f"Jump: added {done} jump(s)."
+
+
+class MQFOLLOW2_OT_add_jump(Operator):
+    bl_idname = "mqfollow2.add_jump"
+    bl_label = "Add Jump Between Selected Markers"
+    bl_description = "Select adjacent markers, or one marker, to jump from it to the next marker"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        pins = get_pins()
+        numbers = _jump_selected_numbers(context)
+        active = context.view_layer.objects.active
+        if not numbers and active is not None and PIN_KEY in active:
+            numbers = [int(active[PIN_KEY])]
+        targets = _jump_plan_selected(numbers, len(pins))
+        if not targets:
+            self.report({'WARNING'}, "Select two neighbouring markers (e.g. 5 and 6), or one marker that has a next marker.")
+            return {'CANCELLED'}
+        for number in targets:
+            setattr(pins[number - 1], JUMP_FLAG, True)
+        _jump_recolor_markers()
+        context.scene.mqfollow2.info = "Jump set: " + ", ".join(f"{n} to {n + 1}" for n in targets) + ". Bake again to apply."
+        return {'FINISHED'}
+
+
+class MQFOLLOW2_OT_remove_jump(Operator):
+    bl_idname = "mqfollow2.remove_jump"
+    bl_label = "Remove Jump"
+    bl_description = "Remove jump settings from selected marker(s)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        pins = get_pins()
+        numbers = _jump_selected_numbers(context)
+        active = context.view_layer.objects.active
+        if not numbers and active is not None and PIN_KEY in active:
+            numbers = [int(active[PIN_KEY])]
+        for number in numbers:
+            if 1 <= number <= len(pins):
+                setattr(pins[number - 1], JUMP_FLAG, False)
+        _jump_recolor_markers()
+        context.scene.mqfollow2.info = "Jump removed. Bake again to apply."
+        return {'FINISHED'}
+
+def _jump_recolor_markers():
+    pins = get_pins()
+    reverse = [bool(getattr(pin, "mqfollow_reverse_mark", False)) for pin in pins]
+    gears = gear_states(reverse)
+    highlighted = set()
+    for index in _jump_pairs(pins):
+        highlighted.update((index, index + 1))
+    for index, pin in enumerate(pins):
+        try:
+            pin.color = JUMP_COLOR if index in highlighted else (
+                (0.2, 0.5, 1.0, 1.0) if gears[index] else (1.0, 0.35, 0.05, 1.0))
+        except Exception:
+            pass
 
 
 class MQFOLLOW2_OT_drive(Operator):
@@ -1988,7 +2239,22 @@ class MQFOLLOW2_OT_drive(Operator):
         try:
             result = self._execute_bake(context)
             if result == {'FINISHED'}:
-                context.area.tag_redraw() if context.area else None
+                try:
+                    jump_count, jump_message = apply_jumps(context)
+                    _jump_recolor_markers()
+                    if jump_message:
+                        current_info = context.scene.mqfollow2.info or ""
+                        context.scene.mqfollow2.info = (current_info + "  " + jump_message).strip()
+                        if jump_count == 0:
+                            self.report({'WARNING'}, jump_message)
+                except Exception as jump_exc:
+                    import traceback
+                    traceback.print_exc()
+                    warning = f"Drive baked, jump failed: {type(jump_exc).__name__}: {jump_exc}"
+                    context.scene.mqfollow2.info = warning
+                    self.report({'WARNING'}, warning)
+                if context.area is not None:
+                    context.area.tag_redraw()
             return result
         except Exception as exc:
             import traceback
@@ -2090,6 +2356,28 @@ def draw_follow(lay, context):
     else:
         lay.label(text="Click a route marker in the viewport to edit its settings.", icon='INFO')
 
+    jump_box = lay.box()
+    jump_box.label(text="Jump", icon='TRIA_UP_BAR')
+    jump_row = jump_box.row(align=True)
+    jump_row.scale_y = 1.2
+    jump_row.operator("mqfollow2.add_jump", text="Add Jump (selected)", icon='ADD')
+    jump_row.operator("mqfollow2.remove_jump", text="Remove", icon='X')
+    jump_box.label(text="Select adjacent markers (e.g. 5 + 6), or one start marker.")
+    if active_pin is not None:
+        jump_box.prop(active_pin, JUMP_FLAG, text=f"Jump: marker {int(active_pin[PIN_KEY])} to next")
+        if bool(getattr(active_pin, JUMP_FLAG, False)):
+            if pins and active_pin is pins[-1]:
+                jump_box.label(text="Last marker: there is no next marker.", icon='ERROR')
+            else:
+                jump_box.prop(active_pin, JUMP_AUTO, text="Auto Height (from air time)")
+                height_col = jump_box.column()
+                height_col.active = not bool(getattr(active_pin, JUMP_AUTO, True))
+                height_col.prop(active_pin, JUMP_HEIGHT, text="Jump Height (m)")
+                jump_box.prop(active_pin, JUMP_TILT, text="Nose Tilt (deg)")
+    jump_count = len(_jump_pairs(pins))
+    if jump_count:
+        jump_box.label(text=f"{jump_count} jump(s) configured. Bake again after changes.", icon='INFO')
+
     dynamics = lay.box()
     dynamics.label(text="Drive Response", icon='TIME')
     dynamics.prop(f, "acceleration_strength", slider=True)
@@ -2137,7 +2425,8 @@ def _mqfollow_marker_visibility_timer():
 classes = (MQFOLLOW2_Props, MQFOLLOW2_OT_place_pins, MQFOLLOW2_OT_stop_placing,
            MQFOLLOW2_OT_toggle_marker_mode, MQFOLLOW2_OT_start_placing,
            MQFOLLOW2_OT_remove_pin, MQFOLLOW2_OT_toggle_markers, MQFOLLOW2_OT_toggle_lines,
-           MQFOLLOW2_OT_select_markers, MQFOLLOW2_OT_drive, MQFOLLOW2_OT_clear)
+           MQFOLLOW2_OT_select_markers, MQFOLLOW2_OT_add_jump, MQFOLLOW2_OT_remove_jump,
+           MQFOLLOW2_OT_drive, MQFOLLOW2_OT_clear)
 OLD_CLASSES = ("MQFOLLOW2_OT_pin", "MQFOLLOW2_OT_bake", "MQFOLLOW2_OT_speed_segments", "MQFOLLOW2_PT_main")
 addon_keymaps = []
 
@@ -2162,8 +2451,12 @@ def unregister():
         pass
     if hasattr(bpy.types.Scene, "mqfollow2"):
         del bpy.types.Scene.mqfollow2
-    if hasattr(bpy.types.Object, "mqfollow_reverse_mark"):
-        del bpy.types.Object.mqfollow_reverse_mark
+    for prop_name in ("mqfollow_reverse_mark", JUMP_FLAG, JUMP_AUTO, JUMP_HEIGHT, JUMP_TILT):
+        if hasattr(bpy.types.Object, prop_name):
+            try:
+                delattr(bpy.types.Object, prop_name)
+            except Exception:
+                pass
     for name in [c.__name__ for c in classes] + list(OLD_CLASSES):
         cls = getattr(bpy.types, name, None)
         if cls is not None:
@@ -2182,6 +2475,18 @@ def register():
         name="Reverse Marker", default=False,
         description="Switch gear at this marker: forward becomes reverse, reverse becomes forward. "
                     "The new gear stays until the next Reverse Marker")
+    bpy.types.Object.mqfollow_jump_mark = BoolProperty(
+        name="Jump to next marker", default=False,
+        description="The car leaves the ground at this marker and lands at the next marker")
+    bpy.types.Object.mqfollow_jump_auto = BoolProperty(
+        name="Auto Height", default=True,
+        description="Calculate jump height from the time between take-off and landing")
+    bpy.types.Object.mqfollow_jump_height = FloatProperty(
+        name="Jump Height", default=1.0, min=0.0, soft_max=5.0, unit='LENGTH',
+        description="Peak jump height when Auto Height is disabled")
+    bpy.types.Object.mqfollow_jump_tilt = FloatProperty(
+        name="Nose Tilt", default=6.0, min=0.0, max=45.0,
+        description="Nose-up / nose-down tilt during the jump, in degrees")
     try:
         if not bpy.app.timers.is_registered(_mqfollow_marker_visibility_timer):
             bpy.app.timers.register(_mqfollow_marker_visibility_timer, first_interval=0.25, persistent=True)

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MQScar",
     "author": "MQS",
-    "version": (0, 23, 0),
+    "version": (0, 24, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar (N) > MQScar",
     "description": "Rigid body car rig generator with car-type presets, plus Curve Mode (marker-driven driving) and Slide (drift-style secondary motion)",
