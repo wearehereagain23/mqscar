@@ -21,6 +21,7 @@ from bpy.app.handlers import persistent
 
 from . import follow     # Curve Mode (marker-driven driving), drawn inside this add-on's panel
 from . import slide      # Slide (secondary motion on the baked drive), drawn inside this add-on's panel
+from . import effects    # Automatic tyre-mark effects
 
 # --------------------------------------------------------------------------
 # Constants
@@ -1809,9 +1810,14 @@ def register():
         bpy.app.handlers.load_post.append(_on_load)
     follow.register()
     slide.register()
+    effects.register()
 
 
 def unregister():
+    try:
+        effects.unregister()
+    except Exception:
+        traceback.print_exc()
     try:
         slide.unregister()
     except Exception:
